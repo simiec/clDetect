@@ -1,16 +1,63 @@
-__kernel void brightSpotsKernel(__global uchar* image, __global uchar* output, 
-                                const int width, const int height, 
-                                const int halfWindow, const float thresholdFactor) {
+
+// OpenCL kernel for removing near-zero points in an image. 
+// This operation helps in noise reduction and focusing on significant features.
+__kernel void deleteNearZeroPointsKernel(
+    __global uchar* image,           // Input image buffer
+    __global uchar* output,          // Output image buffer
+    const int width,                 // Image width
+    const int height,                // Image height
+    const int neighborDistance,      // Distance within which to search for zero neighbors
+    const int zeroCountThreshold) {  // Threshold of zero-valued neighbors to decide on deletion
+    
+    // Get the current working element's x and y coordinates
     int x = get_global_id(0);
     int y = get_global_id(1);
 
+    // Ensure the thread is within image boundaries
+    if (x >= 0 && y >= 0 && x < width && y < height) {
+        int zeroCount = 0;
+
+        // Iterate over the neighborhood of the current pixel
+        for (int dy = -neighborDistance; dy <= neighborDistance; dy++) {
+            for (int dx = -neighborDistance; dx <= neighborDistance; dx++) {
+                int nx = x + dx;
+                int ny = y + dy;
+
+                // Check if the neighbor is within image boundaries
+                if (nx >= 0 && ny >= 0 && nx < width && ny < height) {
+                    // Increment zeroCount if a zero-valued neighbor is found
+                    if (image[ny * width + nx] == 0) {
+                        zeroCount++;
+                    }
+                }
+            }
+        }
+
+        // Set the pixel value to zero if zeroCount exceeds the threshold, otherwise retain the original value
+        output[y * width + x] = (zeroCount > zeroCountThreshold) ? 0 : image[y * width + x];
+    }
+}
+// OpenCL kernel to highlight bright spots in the image based on local neighborhood analysis.
+__kernel void brightSpotsKernel(
+    __global uchar* image,           // Input image buffer
+    __global uchar* output,          // Output image buffer
+    const int width,                 // Image width
+    const int height,                // Image height
+    const int halfWindow,            // Half of the window size for local analysis
+    const float thresholdFactor) {   // Factor to scale the pixel value for brightness detection
+    
+    // Get the current working element's x and y coordinates
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+
+    // Process only the elements that have sufficient surrounding pixels for analysis
     if (x >= halfWindow && y >= halfWindow && x < (width - halfWindow) && y < (height - halfWindow)) {
         double sum = 0;
         int count = 0;
         int brightCount = 0;
         uchar currentPixelValue = image[y * width + x];
 
-        // Compute the sum, count, and brightCount for the local area excluding zeros
+        // Analyze the local neighborhood of the current pixel
         for (int ly = -halfWindow; ly <= halfWindow; ++ly) {
             for (int lx = -halfWindow; lx <= halfWindow; ++lx) {
                 uchar val = image[(y + ly) * width + (x + lx)];
@@ -24,15 +71,13 @@ __kernel void brightSpotsKernel(__global uchar* image, __global uchar* output,
             }
         }
 
+        // Calculate local mean brightness
         double localMean = count > 0 ? sum / count : 0;
 
-        // Determine scoring based on brightness and local area brightness
+        // Highlight bright spots based on the comparison between current pixel value and local mean
         if (currentPixelValue > localMean * thresholdFactor && currentPixelValue != 0) {
             double brightnessScore = currentPixelValue - localMean;
             double areaFactor = brightCount / (double)(count > 0 ? count : 1);
-            
-            // Combine the brightness score and area factor to determine the final score
-            // Here we assume brightnessScore and areaFactor are normalized to [0, 1]
             double score = brightnessScore * areaFactor;
             output[y * width + x] = (uchar)(255.0 * score);
         } else {
@@ -41,39 +86,28 @@ __kernel void brightSpotsKernel(__global uchar* image, __global uchar* output,
     }
 }
 
-__kernel void labelingKernel(__global const uchar* image, __global int* labels, 
-                             const int width, const int height, const uchar threshold) {
+// OpenCL kernel to find the global bounding box of bright areas in the image.
+__kernel void findGlobalBoundingBoxKernel(
+    __global const uchar* image,     // Input image buffer
+    __global int* bbox,              // Output bounding box [minX, maxX, minY, maxY]
+    const int width,                 // Image width
+    const int height,                // Image height
+    const uchar brightnessThreshold) // Brightness threshold to consider for bounding box
+{
+    // Get the current working element's x and y coordinates
     int x = get_global_id(0);
     int y = get_global_id(1);
-    int index = y * width + x;
 
+    // Check only the relevant pixels within the image bounds
     if (x < width && y < height) {
-        uchar pixelValue = image[index];
-        if (pixelValue > threshold) {
-            // Simple labeling: label is the pixel's index
-            labels[index] = index;
-        } else {
-            labels[index] = -1;  // Mark as background
-        }
-    }
-}
-
-
-__kernel void scoringKernel(__global const int* labels, __global uchar* output, 
-                            const int width, const int height, __global const int* sizes, 
-                            const int maxSize) {
-    int x = get_global_id(0);
-    int y = get_global_id(1);
-    int index = y * width + x;
-
-    if (x < width && y < height && labels[index] != -1) {
-        int label = labels[index];
-        int size = sizes[label]; // Size of the component
+        uchar pixelValue = image[y * width + x];
         
-        // Normalize the score based on the size of the component
-        uchar score = (uchar)(255.0f * size / maxSize);
-        output[index] = score;
-    } else {
-        output[index] = 0; // Background or non-bright spot
+        // Update bounding box if the pixel is brighter than the threshold
+        if (pixelValue > brightnessThreshold) {
+            atomic_min(&bbox[0], x); // Update minX
+            atomic_max(&bbox[1], x); // Update maxX
+            atomic_min(&bbox[2], y); // Update minY
+            atomic_max(&bbox[3], y); // Update maxY
+        }
     }
 }

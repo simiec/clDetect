@@ -5,7 +5,6 @@
 namespace visua
 {
   namespace fs = std::filesystem;
-
   class PathFounder{
     public:
       static std::vector<fs::path> getSubDirectories(std::string path){

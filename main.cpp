@@ -18,20 +18,22 @@
 
 #include "pathFounder.h"
 
+// Function to load OpenCL kernel source from a file
 std::string loadKernelSource(const std::string& filename) {
-  std::ifstream file(filename);
-  if (!file.good()) {
-    std::cerr << "Error loading kernel source from file: " << filename << std::endl;
-    exit(1);
-  }
-  return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    std::ifstream file(filename);
+    if (!file.good()) {
+        std::cerr << "Error loading kernel source from file: " << filename << std::endl;
+        exit(1);
+    }
+    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 }
 
+// Alias for the JSON library
 using json = nlohmann::json;
 
 int main(){
 
-  // Initialize OpenCL
+  // Initialize OpenCL by selecting the first available platform and device (preferably NVIDIA GPU)
   std::vector<cl::Platform> platforms;
   cl::Platform::get(&platforms);
   auto platform = platforms.front();
@@ -47,9 +49,11 @@ int main(){
     }
   }
 
+
   cl::Context context(device);
   cl::CommandQueue queue(context, device);
 
+  // Load and build the OpenCL program from the kernel source file
   std::string kernelSource = loadKernelSource("/home/ugurcan/Documents/yl/include/brightSpotKernel.cl");
   cl::Program::Sources sources;
   sources.push_back({kernelSource.c_str(), kernelSource.length()});
@@ -61,6 +65,7 @@ int main(){
     exit(1);
   }
 
+  // Load image and JSON data from the specified directory path
   std::string path_string = "/home/ugurcan/Documents/yl/bruhaga/AhmetV2";
   std::vector<std::filesystem::path> path_vector = visua::PathFounder::getSubDirectories(path_string);
 
@@ -76,26 +81,23 @@ int main(){
   json jsonData;
   jsonFile >> jsonData;
 
+  // Create Image variable from json given path
   cv::Mat image = cv::imread(image_path);
-  cv::Mat copy_image;
-  image.copyTo(copy_image);
-  cv::resize(copy_image, copy_image, cv::Size(800, 600));
 
-  cv::imshow("Original", copy_image);
-
-
+  // Check image
   if (image.empty()) {
     std::cout << "Could not load image: " << image_path << std::endl;
     return -1;
   }
 
+  // Convert the image to grayscale and resize for processing
   cv::Mat grayImage;
   cv::cvtColor(image, grayImage, cv::COLOR_BGR2GRAY);
 
   cv::resize(grayImage, grayImage, cv::Size(800, 600));
 
   float i = 1.0;
-  int halfWindow = 5;
+  int halfWindow = 40;
   bool stopper = false;
   while(true){
 
@@ -103,13 +105,42 @@ int main(){
       i = 1.0;
     }
 
+    /* Create buffers and set kernel arguments for edge detection */
+    cl::Kernel kernel_edge_detection(program, "deleteNearZeroPointsKernel");
+
+    cl::Buffer inputBuffer2(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 
+                            grayImage.total() * grayImage.elemSize(), grayImage.data);
+
+    cl::Buffer outputBuffer2(context, CL_MEM_WRITE_ONLY, 
+                            grayImage.total() * grayImage.elemSize());
+
+
+    // Set the kernel arguments
+    kernel_edge_detection.setArg(0, inputBuffer2);
+    kernel_edge_detection.setArg(1, outputBuffer2);
+    kernel_edge_detection.setArg(2, static_cast<int>(grayImage.cols));
+    kernel_edge_detection.setArg(3, static_cast<int>(grayImage.rows));
+    int neighborDistance = 30;
+    int threshold = 5;
+    kernel_edge_detection.setArg(4, neighborDistance);
+    kernel_edge_detection.setArg(5, threshold);
+
+    queue.enqueueNDRangeKernel(kernel_edge_detection, cl::NullRange, cl::NDRange(grayImage.cols, grayImage.rows), cl::NullRange);
+    queue.finish();
+
+    // Read the processed image from the buffer
+    cv::Mat outputImage2(grayImage.size(), grayImage.type());
+    queue.enqueueReadBuffer(outputBuffer2, CL_TRUE, 0, 
+                            grayImage.total() * grayImage.elemSize(), outputImage2.data);
+
+    /* Bright spot detection kernel setup and execution */
     cl::Kernel kernel(program, "brightSpotsKernel");
 
-    // Create buffers for the input and output
+    // Create buffers for the bright spot detection
     cl::Buffer inputBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 
-                            grayImage.total() * grayImage.elemSize(), grayImage.data);
+                            outputImage2.total() * outputImage2.elemSize(), outputImage2.data);
     cl::Buffer outputBuffer(context, CL_MEM_WRITE_ONLY, 
-                            grayImage.total() * grayImage.elemSize());
+                            outputImage2.total() * outputImage2.elemSize());
 
     // Set the kernel arguments
     kernel.setArg(0, inputBuffer);
@@ -121,154 +152,69 @@ int main(){
     
 
     // Run the kernel
-    queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(grayImage.cols, grayImage.rows), cl::NullRange);
+    queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(outputImage2.cols, outputImage2.rows), cl::NullRange);
     queue.finish();
 
     // Read back the result
-    cv::Mat outputImage(grayImage.size(), grayImage.type());
+    cv::Mat outputImage(outputImage2.size(), outputImage2.type());
     queue.enqueueReadBuffer(outputBuffer, CL_TRUE, 0, 
-                            grayImage.total() * grayImage.elemSize(), outputImage.data);
+                            outputImage2.total() * outputImage2.elemSize(), outputImage.data);
 
+    /* Setup and execute bounding box kernel to find areas of interest */
+    cl::Kernel kernel_bounding_box(program, "findGlobalBoundingBoxKernel");
+
+    // Create buffers
+    cl::Buffer inputBufferBB(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 
+                           outputImage.total() * outputImage.elemSize(), outputImage.data);
+    // Initialize the bounding box values: [INT_MAX, 0, INT_MAX, 0] for [minX, maxX, minY, maxY]
+    int bbox[4] = {INT_MAX, 0, INT_MAX, 0};
+    cl::Buffer bboxBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, 
+                          sizeof(bbox), bbox);
+
+    kernel_bounding_box.setArg(0, inputBufferBB);
+    kernel_bounding_box.setArg(1, bboxBuffer);
+    kernel_bounding_box.setArg(2, static_cast<int>(outputImage.cols));
+    kernel_bounding_box.setArg(3, static_cast<int>(outputImage.rows));
+    uchar brightness_threshold = 20; // Brightness threshold
+    kernel_bounding_box.setArg(4, brightness_threshold);
+
+    // Execute the kernel
+    queue.enqueueNDRangeKernel(kernel_bounding_box, cl::NullRange, cl::NDRange(outputImage.cols, outputImage.rows), cl::NullRange);
+    queue.finish();
+
+    // Read the bounding box result
+    queue.enqueueReadBuffer(bboxBuffer, CL_TRUE, 0, sizeof(bbox), bbox);
+
+
+    // Output and visualization of the bounding box and image processing parameters
+    std::cout << "Global bounding box: "
+              << "minX: " << bbox[0] << ", "
+              << "maxX: " << bbox[1] << ", "
+              << "minY: " << bbox[2] << ", "
+              << "maxY: " << bbox[3] << std::endl;
 
     cv::putText(outputImage, "Thr. Factor: " + std::to_string(i), cv::Point(50,100), cv::FONT_HERSHEY_COMPLEX, 1, cv::Scalar(255));
     cv::putText(outputImage, "Half Window: " + std::to_string(halfWindow), cv::Point(50,50), cv::FONT_HERSHEY_COMPLEX, 1, cv::Scalar(255));
 
+    cv::rectangle(outputImage, cv::Rect2i(bbox[0], bbox[2], bbox[1] - bbox[0], bbox[3] - bbox[2]), cv::Scalar(255), 1);
+
 
     // Display or save the result
     cv::imshow("Output Image", outputImage);
-    char c=(char) cv::waitKey(10);
-    if(c==27) break;
-    else if (c == 32) stopper = !stopper;
-    else if (c == 119) halfWindow++;
-    else if (c == 115) halfWindow--;
-    if (!stopper){
-      i += 0.01;
+    cv::imshow("Output 2: ", outputImage2);
+
+    
+     // Handle user inputs to control the processing loop
+    char c = (char) cv::waitKey(10);
+    if (c == 27) break;                     // Exit on ESC
+    else if (c == 32) stopper = !stopper;   // Space to pause
+    else if (c == 119) halfWindow++;        // 'w' to increase halfWindow
+    else if (c == 115) halfWindow--;        // 's' to decrease halfWindow
+
+    if (!stopper) {
+      i += 0.01;  // Increment the threshold factor to adjust brightness detection
     }
   }
-
-  /*
-
-  // Iterate over shapes in the JSON and draw polygons
-    for (const auto& shape : jsonData["shapes"]) {
-      // Check if the shape is a polygon
-      if (shape["shape_type"] == "polygon") {
-        std::vector<cv::Point> points;
-        for (const auto& pt : shape["points"]) {
-          points.push_back(cv::Point(pt[0], pt[1]));
-        }
-
-        // Draw the polygon
-        const cv::Point* pts = (const cv::Point*) cv::Mat(points).data;
-        int npts = cv::Mat(points).rows;
-
-        cv::polylines(image, &pts, &npts, 1, true, cv::Scalar(0, 255, 0), 3);
-      }
-    }
-
-    int histSize = 256; // number of bins
-    float range[] = { 1, 256 }; // exclude 0
-    const float* histRange = { range };
-    cv::Mat hist;
-    cv::calcHist(&grayImage, 1, 0, cv::Mat(), hist, 1, &histSize, &histRange, true, false);
-
-    // Compute the average of histogram values excluding the zero bin
-    double sum = 0;
-    int count = 0;
-    for (int i = 1; i < histSize; ++i) { // start from 1 to exclude the zero bin
-        sum += hist.at<float>(i) * i;
-        count += hist.at<float>(i);
-    }
-    double avg = count > 0 ? sum / count : 0;
-
-    cv::Mat resizedImage_org;
-    cv::resize(image, resizedImage_org, cv::Size(800, 600));
-
-    cv::Mat resizedImage_gray;
-    cv::resize(grayImage, resizedImage_gray, cv::Size(800, 600));
-
-    cv::Mat output = cv::Mat::zeros(resizedImage_gray.size(), resizedImage_gray.type());
-
-    int windowSize = 30; // Define the local window size
-    int halfWindow = windowSize / 2;
-    double thresholdFactor = 2.0; // Factor to determine how much brighter the pixel should be compared to the local average
-
-    for (int y = halfWindow; y < resizedImage_gray.rows - halfWindow; ++y) {
-      for (int x = halfWindow; x < resizedImage_gray.cols - halfWindow; ++x) {
-        // Define the local region
-        cv::Rect localRect(x - halfWindow, y - halfWindow, windowSize, windowSize);
-        cv::Mat localArea = resizedImage_gray(localRect);
-
-        // Compute the mean of the local area excluding zeros
-        double sum = 0;
-        int count = 0;
-        for (int ly = 0; ly < localArea.rows; ++ly) {
-          for (int lx = 0; lx < localArea.cols; ++lx) {
-            uchar val = localArea.at<uchar>(ly, lx);
-            if (val != 0) {
-              sum += val;
-              count++;
-            }
-          }
-        }
-
-        double localMean = count > 0 ? sum / count : 0;
-
-        // Compare the current pixel to the local mean
-        uchar currentPixelValue = resizedImage_gray.at<uchar>(y, x);
-        if (currentPixelValue > localMean * thresholdFactor && currentPixelValue != 0) {
-          output.at<uchar>(y, x) = 255; // Mark as bright spot
-        }
-      }
-    }
-
-    cv::Mat resizedImage_out;
-    cv::resize(output, resizedImage_out, cv::Size(800, 600));
-
-    cv::imshow("Bright Spot Image", resizedImage_out);
-
-    // Set a threshold based on the average
-    cv::imshow("Original Image", resizedImage_org);
-
-    double thresholdValue = avg;
-    cv::Mat binaryImage;
-    int i = 0;
-    bool stopper = false;
-    while(true){
-      if (i == 255){
-        i = 0;
-      }
-
-      cv::threshold(grayImage, binaryImage, i, 255, cv::THRESH_BINARY);
-
-      cv::Mat resizedImage;
-      cv::resize(binaryImage, resizedImage, cv::Size(800, 600));
-
-      cv::putText(resizedImage, std::to_string(i), cv::Point(50,100), cv::FONT_HERSHEY_COMPLEX, 1, cv::Scalar(255));
-      cv::putText(resizedImage, "Hist Avr: " + std::to_string(thresholdValue), cv::Point(50,50), cv::FONT_HERSHEY_COMPLEX, 1, cv::Scalar(255));
-
-      // Display the image
-      cv::imshow("Image with Polygons", resizedImage);
-
-
-      // Press  ESC on keyboard to exit
-      if (i == int (thresholdValue)){
-        char c=(char) cv::waitKey(500);
-        if(c==27) break;
-      }
-      else{
-        char c=(char) cv::waitKey(10);
-        if(c==27) break;
-        else if (c == 32) stopper = !stopper;
-      }
-
-      if (!stopper){
-        i++;
-      }
-    }
-    
-    cv::waitKey(0);
-
-    */
 
   return 0;
 }
